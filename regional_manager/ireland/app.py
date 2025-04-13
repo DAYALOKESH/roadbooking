@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException
-from typing import List, Tuple
+from fastapi import FastAPI, HTTPException, Body
+from typing import List, Tuple, Dict
 from database import SessionLocal
 from models import SegmentRequest, RegionalSegment, BookingSegment
 import uvicorn
@@ -19,19 +19,21 @@ async def process_segment(segment_request: SegmentRequest):
     name = segment_request.name
     email = segment_request.email
     start_time = segment_request.start_time
+    print(coordinates)
 
     db = SessionLocal()
     segment_service = SegmentService(db)
     try:
         # Convert route coordinates to segment IDs
         segment_ids = segment_service.convert_route_to_segments(coordinates)
-
+        print(f"Found {len(segment_ids)} segments: {segment_ids}")
         # Check if all segments have sufficient capacity
         if not segment_service.check_segments_capacity(segment_ids):
             raise HTTPException(status_code=400, detail="Insufficient capacity on one or more segments")
 
         # Reserve segments for the booking
         segment_service.reserve_segments(booking_id, segment_ids)
+        print(f"Successfully reserved {len(segment_ids)} segments for booking {booking_id}")
 
     except Exception as e:
         db.rollback()
@@ -42,7 +44,10 @@ async def process_segment(segment_request: SegmentRequest):
     return {"status": "success", "message": "Segment processed successfully"}
 
 @app.post("/confirm_booking")
-async def confirm_booking(booking_id: str):
+async def confirm_booking(data: Dict[str, str] = Body(...)):
+    booking_id = data.get("booking_id")
+    if not booking_id:
+        raise HTTPException(status_code=400, detail="booking_id is required")
     db = SessionLocal()
     try:
         segment_service = SegmentService(db)
@@ -56,18 +61,37 @@ async def confirm_booking(booking_id: str):
     return {"status": "success", "message": "Booking confirmed"}
 
 @app.post("/cancel_booking")
-async def cancel_booking(booking_id: str):
+async def cancel_booking(data: Dict[str, str] = Body(...)):
+    booking_id = data.get("booking_id")
+    if not booking_id:
+        raise HTTPException(status_code=400, detail="booking_id is required")
     db = SessionLocal()
     try:
         segment_service = SegmentService(db)
-        segment_service.cancel_booking(booking_id)
+        result = segment_service.cancel_booking(booking_id)
+        return result
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to cancel booking: {str(e)}")
     finally:
         db.close()
 
-    return {"status": "success", "message": "Booking cancelled"}
+
+
+
+# this gen points gets the booking id from the user then query the segments from the database and return the segments that are associated with that booking id
+# if the booking id is not found return a error message
+# also we will return the current load of the segments
+@app.get("/get_segments/{booking_id}")
+async def get_segments(booking_id: str):
+    db = SessionLocal()
+    try:
+        segment_service = SegmentService(db)
+        result = segment_service.get_segments(booking_id)
+        return result
+    finally:
+        db.close()
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)

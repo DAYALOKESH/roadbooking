@@ -25,13 +25,11 @@ class RoadSegment(Base):
     name = Column(String)
 
     # Define relationships if needed
-    booking_segments = relationship("BookingSegment", back_populates="road_segment")
-
 class RegionalSegment(Base):
     __tablename__ = 'regional_segments'
     __table_args__ = {'extend_existing': True}  # Add this line
-    id = Column(Integer, primary_key=True, index=True)
-    booking_id = Column(String, index=True)
+    id = Column(Integer, primary_key=True)
+    booking_id = Column(String)
     coordinates = Column(String)  # Store coordinates as a string
     name = Column(String)
     email = Column(String)
@@ -40,11 +38,10 @@ class RegionalSegment(Base):
 class BookingSegment(Base):
     __tablename__ = 'booking_segments'
     __table_args__ = {'extend_existing': True}  # Add this line
-    id = Column(Integer, primary_key=True, index=True)
-    booking_id = Column(String, index=True)
-    segment_id = Column(String, ForeignKey('road_segments.segment_id'), index=True)
+    id = Column(Integer, primary_key=True)
+    booking_id = Column(String)
+    segment_id = Column(String, ForeignKey('road_segments.segment_id'))
     segment_order = Column(Integer)
     status = Column(String)  # Status can be 'waiting', 'success', or 'failed'
 
     # Define relationships if needed
-    road_segment = relationship("RoadSegment", back_populates="booking_segments")

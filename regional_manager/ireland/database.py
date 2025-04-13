@@ -7,7 +7,7 @@ Base = declarative_base()
 
 
 # Database setup
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/road_capacity"
+DATABASE_URL = "postgresql://postgres:postgres@localhost:5433/road_capacity"
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
