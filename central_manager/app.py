@@ -9,41 +9,45 @@ import asyncio
 from database import SessionLocal
 from models import UserRequest, BookingInfo
 from database import Base, engine
+from sqlalchemy.exc import IntegrityError
+import logging
 
 Base.metadata.create_all(bind=engine)
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
 app = FastAPI(title="Multi-region service Manger")
 
 REGION_ENDPOINTS = {
-    "ireland": os.getenv("EUROPE_ENDPOINT", "http://localhost:8001"),
-    "london": os.getenv("ASIA_ENDPOINT", "http://localhost:8002"),
+    "ireland": os.getenv("DUBLIN_ENDPOINT", "http://localhost:8001"),
+    "london": os.getenv("LONDON_ENDPOINT", "http://localhost:8002"),
     "australia": os.getenv("AUSTRALIA_ENDPOINT", "http://localhost:8003"),
     "america": os.getenv("AMERICA_ENDPOINT", "http://localhost:8004"),
 }
 region_boundaries = {
-        "ireland": {
-            "min_latitude": 51.0,
-            "max_latitude": 55.5,
-            "min_longitude": -10.5,
-            "max_longitude": -5.5
-        },
-        "london": {
-            "min_latitude": 51.28,
-            "max_latitude": 51.686,
-            "min_longitude": -0.510,
-            "max_longitude": 0.334
-        }
-        # Add other regions as needed
+    "ireland": {
+        "min_latitude": 51.4,
+        "max_latitude": 55.4,
+        "min_longitude": -10.7,
+        "max_longitude": -5.4
+    },
+    "london": {
+        "min_latitude": 49.9,
+        "max_latitude": 60.9,
+        "min_longitude": -8.6,
+        "max_longitude": 1.8
     }
-
-# user will give me the Name, Email, Start Coordinates and Destination Cordinates and start time
-# pydantic model for the request body
+}
 
 
-
-# route endpoint for user to make request to send the info
 @app.post("/send_request")
 async def get_info(user_request: UserRequest):
-    #user will give me the Name, Email, Start Coordinates and Destination Cordinates and start time
+    # Extract user request details
     name = user_request.name
     email = user_request.email
     start_coordinates = user_request.start_coordinates
@@ -54,14 +58,11 @@ async def get_info(user_request: UserRequest):
     start_latitude, start_longitude = start_coordinates.split(",")
     dest_latitude, dest_longitude = destination_coordinates.split(",")
 
-    # get the path
+    # Get the path
     path = await fetch_route(start_longitude, start_latitude, dest_longitude, dest_latitude)
-    print(path)
-
     segments = segment_path(path, region_boundaries)
 
     involved_regions = set()
-    # Prepare tasks for sending segments to regional managers
     tasks = []
     async with httpx.AsyncClient() as client:
         for segment_id, segment_info in segments.items():
@@ -81,12 +82,19 @@ async def get_info(user_request: UserRequest):
                             "email": email,
                             "start_time": start_time
                         },
-                        timeout=60.0
+                        timeout=1000.0
                     )
                 )
 
         # Execute all tasks concurrently and wait for their completion
         responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Log responses for debugging
+    for i, response in enumerate(responses):
+        if isinstance(response, Exception):
+            logger.error(f"Error in response {i}: {str(response)}")
+        else:
+            logger.debug(f"Response {i} status: {response.status_code}, content: {response.text}")
 
     # Check if all responses were successful
     all_success = all(not isinstance(response, Exception) and response.status_code == 200 for response in responses)
@@ -95,28 +103,39 @@ async def get_info(user_request: UserRequest):
             region_endpoint = REGION_ENDPOINTS.get(region)
             if region_endpoint:
                 if all_success:
-                    await client.post(f"{region_endpoint}/confirm_booking", json={"booking_id": booking_id})
+                    await client.post(f"{region_endpoint}/confirm_booking", json={"booking_id": booking_id},
+                                      timeout=1000.0)
                 else:
-                    await client.post(f"{region_endpoint}/cancel_booking", json={"booking_id": booking_id})
+                    await client.post(f"{region_endpoint}/cancel_booking", json={"booking_id": booking_id},
+                                      timeout=120.0)
 
     db = SessionLocal()
-    for segment_id, segment_info in segments.items():
-        region = segment_info["region"]
+    try:
+        # Concatenate regions into a single string
+        region_string = ",".join(involved_regions)
         status = "success" if all_success else "failure"
+
+        # Store a single booking info entry
         booking_info = BookingInfo(
             booking_id=booking_id,
             start_location=start_coordinates,
             end_location=destination_coordinates,
-            region=region,
+            region=region_string,
             status=status
         )
         db.add(booking_info)
-    db.commit()
-    db.close()
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        logger.error(f"IntegrityError: {str(e)}")
+        raise HTTPException(status_code=400, detail="Duplicate booking ID detected. Please try again.")
+    finally:
+        db.close()
 
     results = {f"segment_{i + 1}": (response.text if not isinstance(response, Exception) else f"Error: {str(response)}")
                for i, response in enumerate(responses)}
     return {"booking_id": booking_id, "results": results}
+
 
 async def fetch_route(start_longitude: float, start_latitude: float, dest_longitude: float, dest_latitude: float):
     # Construct the OSRM API URL
@@ -125,7 +144,7 @@ async def fetch_route(start_longitude: float, start_latitude: float, dest_longit
         f"{start_longitude},{start_latitude};"
         f"{dest_longitude},{dest_latitude}?overview=full"
     )
-
+    print(f"Requesting OSRM URL: {osrm_url}")
     # Make an asynchronous request to the OSRM server
     async with httpx.AsyncClient() as client:
         response = await client.get(osrm_url)
@@ -133,6 +152,7 @@ async def fetch_route(start_longitude: float, start_latitude: float, dest_longit
     # Check if the request was successful
     if response.status_code == 200:
         route_data = response.json()
+        print(f"OSRM Response: {route_data}")
         # Extract the path from the route data
         if 'routes' in route_data and len(route_data['routes']) > 0:
             return route_data['routes'][0]['geometry']
@@ -140,7 +160,6 @@ async def fetch_route(start_longitude: float, start_latitude: float, dest_longit
             raise HTTPException(status_code=404, detail="No route found")
     else:
         raise HTTPException(status_code=response.status_code, detail="Failed to fetch route from OSRM server")
-
 
 
 def segment_path(path: str, boundaries: Dict[str, Dict[str, float]]) -> Dict[str, List[Tuple[float, float]]]:
@@ -159,7 +178,8 @@ def segment_path(path: str, boundaries: Dict[str, Dict[str, float]]) -> Dict[str
                 if current_region != region:
                     if current_region is not None:
                         # Save the current segment under the current region
-                        segments[f"segment_{len(segments) + 1}"] = {"region": current_region, "coordinates": current_segment}
+                        segments[f"segment_{len(segments) + 1}"] = {"region": current_region,
+                                                                    "coordinates": current_segment}
                     current_region = region
                     current_segment = []
                 current_segment.append(coord)
@@ -169,6 +189,7 @@ def segment_path(path: str, boundaries: Dict[str, Dict[str, float]]) -> Dict[str
         segments[f"segment_{len(segments) + 1}"] = {"region": current_region, "coordinates": current_segment}
 
     return segments
+
 
 @app.get("/booking_status/{booking_id}")
 async def get_booking_status(booking_id: str):
@@ -182,20 +203,19 @@ async def get_booking_status(booking_id: str):
     else:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-#user will give me the booking id and i will check the status by calling the above booking status endpoint and if the booking status is success
-# we will query the db and will get the regions of the booking id and we will send the request to the regional manager to get the segemnts from the regional manager
+
 @app.get("/get_segments/{booking_id}")
 async def get_segments(booking_id: str):
     # Query the database for all booking entries with this booking ID
     db = SessionLocal()
-    booking_infos = db.query(BookingInfo).filter(BookingInfo.booking_id == booking_id).all()
+    booking_infos = db.query(BookingInfo).filter(BookingInfo.booking_id == booking_id).first()
     db.close()
 
     if not booking_infos:
         raise HTTPException(status_code=404, detail="Booking not found")
 
     # Get unique regions associated with this booking
-    regions = set(info.region for info in booking_infos)
+    regions = set(booking_infos.region.split(","))
 
     # Prepare tasks for querying each regional manager
     tasks = []
@@ -209,8 +229,7 @@ async def get_segments(booking_id: str):
                 tasks.append(
                     client.get(f"{region_endpoint}/get_segments/{booking_id}")
                 )
-                region_responses[len(tasks)-1] = region
-
+                region_responses[len(tasks) - 1] = region
 
         # Execute all tasks concurrently and wait for completion
         responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -238,18 +257,18 @@ async def get_segments(booking_id: str):
         "segments": all_segments
     }
 
-# cancel booking endpoint
+
 @app.post("/cancel_booking/{booking_id}")
 async def cancel_booking(booking_id: str):
-    # Query the database for all booking entries with this booking ID
+    # Query the database for the booking entry with this booking ID
     db = SessionLocal()
     try:
-        booking_infos = db.query(BookingInfo).filter(BookingInfo.booking_id == booking_id).all()
+        booking_info = db.query(BookingInfo).filter(BookingInfo.booking_id == booking_id).first()
 
-        if not booking_infos:
+        if not booking_info:
             raise HTTPException(status_code=404, detail="Booking not found")
 
-        if all(info.status == "cancelled" for info in booking_infos):
+        if booking_info.status == "cancelled":
             return {
                 "booking_id": booking_id,
                 "status": "already_cancelled",
@@ -257,7 +276,7 @@ async def cancel_booking(booking_id: str):
             }
 
         # Get unique regions associated with this booking
-        regions = set(info.region for info in booking_infos)
+        regions = set(booking_info.region.split(","))
         tasks = []
         region_responses = {}
         async with httpx.AsyncClient() as client:
@@ -275,7 +294,8 @@ async def cancel_booking(booking_id: str):
 
             # Execute all tasks concurrently and wait for completion
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-         # Process responses from all regions
+
+        # Process responses from all regions
         regional_results = {}
         all_successful = True
         total_segments_cancelled = 0
@@ -305,10 +325,8 @@ async def cancel_booking(booking_id: str):
                 total_segments_cancelled += response_data.get("segments_cancelled", 0)
                 total_segments_freed += response_data.get("segments_freed", 0)
 
-            # Update booking status to "cancelled" in all BookingInfo entries
-        for booking_info in booking_infos:
-            booking_info.status = "cancelled"
-
+        # Update booking status to "cancelled"
+        booking_info.status = "cancelled"
         db.commit()
 
         return {
@@ -328,4 +346,3 @@ async def cancel_booking(booking_id: str):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
