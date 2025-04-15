@@ -12,6 +12,15 @@ from database import Base, engine
 from sqlalchemy.exc import IntegrityError
 import logging
 
+from fastapi.middleware.cors import CORSMiddleware
+
+
+origins = [
+    "*",  # or whatever your frontend address is
+]
+
+
+
 Base.metadata.create_all(bind=engine)
 
 logger = logging.getLogger(__name__)
@@ -22,6 +31,13 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 app = FastAPI(title="Multi-region service Manger")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 REGION_ENDPOINTS = {
     "ireland": os.getenv("DUBLIN_ENDPOINT", "http://localhost:8001"),

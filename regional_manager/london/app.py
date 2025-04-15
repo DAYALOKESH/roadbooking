@@ -10,11 +10,22 @@ logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 from database import Base, engine
-
+from fastapi.middleware.cors import CORSMiddleware
 
 Base.metadata.create_all(bind=engine, checkfirst=True)
 
 app = FastAPI(title="Regional Manager - London")
+
+origins = [
+    "*",  # or whatever your frontend address is
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.post("/process_segment")
 async def process_segment(segment_request: SegmentRequest):

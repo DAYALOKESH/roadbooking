@@ -6,11 +6,22 @@ import uvicorn
 from service.segment_service import SegmentService
 
 from database import Base, engine
-
+from fastapi.middleware.cors import CORSMiddleware
 
 Base.metadata.create_all(bind=engine, checkfirst=True)
 
 app = FastAPI(title="Regional Manager - Ireland")
+
+origins = [
+    "http://localhost:3000",  # or whatever your frontend address is
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.post("/process_segment")
 async def process_segment(segment_request: SegmentRequest):
