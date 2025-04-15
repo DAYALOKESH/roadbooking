@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+httpx
+polyline
+uuid
+asyncio
+SQLAlchemy
+GeoAlchemy2
+shapely
