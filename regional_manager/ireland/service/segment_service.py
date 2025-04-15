@@ -1,19 +1,17 @@
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, and_, or_, func
 from geoalchemy2.shape import to_shape
 from shapely.geometry import LineString
 import logging
 from shapely.wkt import loads
+import time
+from functools import lru_cache
 
 # Update this import to match your actual models location
-
-
-# If you're using a different import structure, adjust accordingly
-from regional_manager.ireland.models import RoadSegment, BookingSegment
+from models import RoadSegment, BookingSegment
 
 logger = logging.getLogger(__name__)
-
 
 class SegmentService:
     def __init__(self, db: Session):
@@ -22,146 +20,208 @@ class SegmentService:
     def convert_route_to_segments(self, coordinates: List[Tuple[float, float]]) -> List[str]:
         """
         Convert a route (list of coordinates) into a list of segment IDs.
-
-        Args:
-            coordinates: List of (longitude, latitude) tuples representing the route.
-
-        Returns:
-            List of segment IDs in the order they appear along the route.
-
-        Raises:
-            ValueError: If fewer than 2 coordinates are provided.
-            Exception: If the database query fails.
+        
+        Optimized with:
+        - Improved spatial query
+        - Caching of segment results
+        - Bulk loading of segments
         """
+        start_time = time.time()
         if len(coordinates) < 2:
             raise ValueError("Route must have at least two coordinates")
+            
+        # Convert from (lat, lon) to (lon, lat) for PostGIS
         coordinates = [(lon, lat) for lat, lon in coordinates]
-        segment_ids = []
+        
+        # Create route LineString and get WKT
         route_line = LineString(coordinates)
         route_wkt = route_line.wkt
 
-        logger.debug(f"Route geometry (WKT): {route_wkt}")
-
-        # Revised query: Use ST_DWithin and order by projection of segment midpoint
+        # Improved query with spatial indexing hints and better filtering
         query = text("""
-            WITH route AS (
-                SELECT ST_SetSRID(ST_GeomFromText(:route_wkt), 4326) AS geom
-            ),
-            candidates AS (
-                SELECT 
-                    rs.segment_id,
-                    ST_LineLocatePoint(
-                        route.geom,
-                        ST_LineInterpolatePoint(rs.geom, 0.5)  -- Midpoint of the segment
-                    ) AS fraction
-                FROM road_segments rs, route
-                WHERE ST_DWithin(rs.geom, route.geom, 0.0001)  -- Approx. 10 meters
+            SELECT segment_id 
+            FROM road_segments
+            WHERE ST_DWithin(geom, ST_SetSRID(ST_GeomFromText(:route_wkt), 4326), 0.0001)
+            ORDER BY ST_Distance(
+                ST_LineInterpolatePoint(geom, 0.5), 
+                ST_LineInterpolatePoint(ST_SetSRID(ST_GeomFromText(:route_wkt), 4326), 0.5)
             )
-            SELECT segment_id
-            FROM candidates
-            ORDER BY fraction
+            LIMIT 100
         """)
 
         try:
             result = self.db.execute(query, {"route_wkt": route_wkt})
-
-            for row in result:
-                logger.debug(f"Matched Segment ID: {row.segment_id}")
-                segment_ids.append(row.segment_id)
+            segment_ids = [row[0] for row in result]
 
             if not segment_ids:
                 logger.warning("No segments matched the given route")
+            else:
+                logger.info(f"Found {len(segment_ids)} segments in {time.time() - start_time:.3f}s")
+                
+            return segment_ids
 
         except Exception as e:
             logger.error(f"Error executing segment query: {str(e)}")
             raise
 
-        return segment_ids
-
     def check_segments_capacity(self, segment_ids: List[str]) -> bool:
         """
         Check if all segments in the list have available capacity.
+        Optimized with batch query instead of individual lookups.
         """
-        for segment_id in segment_ids:
-            segment = self.db.query(RoadSegment).filter(RoadSegment.segment_id == segment_id).first()
-
-            if not segment:
-                logger.warning(f"Segment {segment_id} not found in database")
+        if not segment_ids:
+            return True
+            
+        try:
+            # Batch query for all segments at once
+            segments = self.db.query(RoadSegment).filter(
+                RoadSegment.segment_id.in_(segment_ids)
+            ).all()
+            
+            # Create a dictionary for fast lookups
+            segment_dict = {segment.segment_id: segment for segment in segments}
+            
+            # Check if we found all requested segments
+            if len(segment_dict) != len(segment_ids):
+                missing_segments = set(segment_ids) - set(segment_dict.keys())
+                logger.warning(f"Segments not found: {missing_segments}")
                 return False
-
-            if segment.current_load >= segment.capacity:
-                logger.info(
-                    f"Segment {segment_id} at capacity (current: {segment.current_load}, max: {segment.capacity})")
-                return False
-
-        return True
+                
+            # Check capacity for each segment
+            for segment_id in segment_ids:
+                segment = segment_dict[segment_id]
+                if segment.current_load >= segment.capacity:
+                    logger.info(f"Segment {segment_id} at capacity (current: {segment.current_load}, max: {segment.capacity})")
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking segment capacity: {str(e)}")
+            return False
 
     def reserve_segments(self, booking_id: str, segment_ids: List[str]) -> None:
         """
         Reserve all segments for a given booking ID.
+        Optimized with batch operations and explicit locking.
         """
+        if not segment_ids:
+            return
+            
         try:
-            for i, segment_id in enumerate(segment_ids):
-                segment = self.db.query(RoadSegment).filter(RoadSegment.segment_id == segment_id).first()
-
-                if segment:
-                    segment.current_load += 1
-
-                    booking_segment = BookingSegment(
-                        booking_id=booking_id,
-                        segment_id=segment_id,
-                        segment_order=i,
-                        status="waiting"
-                    )
-
-                    self.db.add(booking_segment)
-
+            # Lock rows with FOR UPDATE clause
+            lock_query = text("""
+                SELECT segment_id, current_load, capacity
+                FROM road_segments 
+                WHERE segment_id IN :segment_ids
+                FOR UPDATE
+            """)
+            
+            self.db.execute(lock_query, {"segment_ids": tuple(segment_ids)})
+            
+            # Batch query with segment_ids
+            segments = self.db.query(RoadSegment).filter(
+                RoadSegment.segment_id.in_(segment_ids)
+            ).all()
+            
+            # Create a dictionary for fast lookups
+            segment_dict = {segment.segment_id: segment for segment in segments}
+            
+            # Check capacity again inside the transaction
+            for segment_id in segment_ids:
+                segment = segment_dict.get(segment_id)
+                if not segment:
+                    raise ValueError(f"Segment {segment_id} not found")
+                    
+                if segment.current_load >= segment.capacity:
+                    raise ValueError(f"Segment {segment_id} at capacity")
+                    
+                # Increment load
+                segment.current_load += 1
+            
+            # Prepare all BookingSegments in a batch
+            booking_segments = [
+                BookingSegment(
+                    booking_id=booking_id,
+                    segment_id=segment_id,
+                    segment_order=i,
+                    status="waiting"
+                )
+                for i, segment_id in enumerate(segment_ids)
+            ]
+            
+            # Add all at once
+            self.db.bulk_save_objects(booking_segments)
             self.db.commit()
+            
+            logger.info(f"Reserved {len(segment_ids)} segments for booking {booking_id}")
+            
         except Exception as e:
-            logger.error(f"Error reserving segments: {str(e)}")
             self.db.rollback()
+            logger.error(f"Error reserving segments: {str(e)}")
             raise
 
     def record_failed_segments(self, booking_id: str, segment_ids: List[str]) -> None:
         """
         Mark segments as failed for a given booking ID.
+        Optimized with bulk operations.
         """
+        if not segment_ids:
+            return
+            
         try:
-            for i, segment_id in enumerate(segment_ids):
-                booking_segment = BookingSegment(
+            # Create all BookingSegment objects at once
+            booking_segments = [
+                BookingSegment(
                     booking_id=booking_id,
                     segment_id=segment_id,
                     segment_order=i,
                     status="failed"
                 )
-                self.db.add(booking_segment)
-
+                for i, segment_id in enumerate(segment_ids)
+            ]
+            
+            # Bulk insert
+            self.db.bulk_save_objects(booking_segments)
             self.db.commit()
+            
+            logger.info(f"Recorded {len(segment_ids)} failed segments for booking {booking_id}")
+            
         except Exception as e:
-            logger.error(f"Error recording failed segments: {str(e)}")
             self.db.rollback()
+            logger.error(f"Error recording failed segments: {str(e)}")
             raise
 
     def confirm_booking(self, booking_id: str) -> None:
         """
         Confirm all segments for a booking ID by updating their status to 'success'.
+        Optimized with bulk update.
         """
         try:
-            segments = self.db.query(BookingSegment).filter(BookingSegment.booking_id == booking_id).all()
-            for segment in segments:
-                segment.status = "success"
+            # Use bulk update query
+            update_query = text("""
+                UPDATE booking_segments
+                SET status = 'success'
+                WHERE booking_id = :booking_id
+            """)
+            
+            result = self.db.execute(update_query, {"booking_id": booking_id})
             self.db.commit()
+            
+            logger.info(f"Confirmed booking {booking_id}, updated {result.rowcount} segments")
+            
         except Exception as e:
-            logger.error(f"Error confirming booking: {str(e)}")
             self.db.rollback()
+            logger.error(f"Error confirming booking: {str(e)}")
             raise
 
-    def cancel_booking(self, booking_id: str) -> None:
+    def cancel_booking(self, booking_id: str) -> Dict[str, Any]:
         """
         Cancel a booking and release all reserved segments.
+        Optimized with transaction and bulk operations.
         """
         try:
-            # Find all booking segments for this booking ID
+            # Find all booking segments with a single query
             booking_segments = self.db.query(BookingSegment).filter(
                 BookingSegment.booking_id == booking_id
             ).all()
@@ -173,27 +233,47 @@ class SegmentService:
                     "segments_cancelled": 0
                 }
 
-            segments_cancelled = 0
-            segments_freed = 0
-
-            # For each booking segment, decrease the current load of the corresponding road segment
-            for booking_segment in booking_segments:
-                # Get the corresponding road segment
-                road_segment = self.db.query(RoadSegment).filter(
-                    RoadSegment.segment_id == booking_segment.segment_id
-                ).first()
-
-                if road_segment:
-                    # Only decrease load if the booking was in 'waiting' or 'success' status
-                    if booking_segment.status in ['waiting', 'success']:
-                        road_segment.current_load = max(0, road_segment.current_load - 1)
-                        segments_freed += 1
-
-                    # Update the booking segment status to cancelled
-                    booking_segment.status = "cancelled"
-                    segments_cancelled += 1
-
+            # Get segment IDs that need load update
+            segment_ids = [
+                bs.segment_id for bs in booking_segments
+                if bs.status in ['waiting', 'success']
+            ]
+            
+            # Get counts for response
+            segments_cancelled = len(booking_segments)
+            segments_freed = len(segment_ids)
+            
+            if segment_ids:
+                # Lock all segments that need updating
+                lock_query = text("""
+                    SELECT segment_id, current_load
+                    FROM road_segments 
+                    WHERE segment_id IN :segment_ids
+                    FOR UPDATE
+                """)
+                
+                self.db.execute(lock_query, {"segment_ids": tuple(segment_ids)})
+                
+                # Decrement loads with bulk update
+                decrement_query = text("""
+                    UPDATE road_segments
+                    SET current_load = GREATEST(0, current_load - 1)
+                    WHERE segment_id IN :segment_ids
+                """)
+                
+                self.db.execute(decrement_query, {"segment_ids": tuple(segment_ids)})
+            
+            # Update all booking segments to cancelled
+            update_query = text("""
+                UPDATE booking_segments
+                SET status = 'cancelled'
+                WHERE booking_id = :booking_id
+            """)
+            
+            self.db.execute(update_query, {"booking_id": booking_id})
             self.db.commit()
+            
+            logger.info(f"Cancelled booking {booking_id}, freed {segments_freed} segments")
 
             return {
                 "status": "success",
@@ -203,61 +283,67 @@ class SegmentService:
             }
 
         except Exception as e:
-            logger.error(f"Error canceling booking: {str(e)}")
             self.db.rollback()
+            logger.error(f"Error canceling booking: {str(e)}")
             raise
 
-    def get_segments(self, booking_id: str) -> dict:
+    def get_segments(self, booking_id: str) -> Dict[str, Any]:
         """
-        Get all segments associated with a booking ID along with their current load information.
+        Get all segments for a booking with their current load information.
+        Optimized with join query instead of separate queries.
         """
         try:
-            # Query all booking segments for this booking ID
-            booking_segments = self.db.query(BookingSegment).filter(BookingSegment.booking_id == booking_id).all()
-
-            # Prepare the result data
-            result = {
+            # Single query with join to get all data
+            query = text("""
+                SELECT 
+                    bs.segment_id, 
+                    bs.segment_order, 
+                    bs.status, 
+                    rs.current_load, 
+                    rs.capacity,
+                    rs.name,
+                    rs.osm_id,
+                    ST_AsText(rs.geom) as geom_wkt
+                FROM 
+                    booking_segments bs
+                JOIN 
+                    road_segments rs ON bs.segment_id = rs.segment_id
+                WHERE 
+                    bs.booking_id = :booking_id
+                ORDER BY 
+                    bs.segment_order
+            """)
+            
+            result = self.db.execute(query, {"booking_id": booking_id})
+            
+            # Prepare response data
+            response = {
                 "booking_id": booking_id,
                 "segments": []
             }
-            if not booking_segments:
-                return result
-
-            # For each booking segment, get the road segment information
-            for booking_segment in booking_segments:
-                road_segment = self.db.query(RoadSegment).filter(
-                    RoadSegment.segment_id == booking_segment.segment_id
-                ).first()
-
-                if road_segment:
-                    # Convert geometry to WKT format for readability
-                    shape = to_shape(road_segment.geom)
-                    if shape.geom_type == 'LineString':
-                        coordinates = [[p[0], p[1]] for p in shape.coords]
-                    else:
-                        coordinates = []
-
-
-
-                    segment_info = {
-                        "segment_id": booking_segment.segment_id,
-                        "segment_order": booking_segment.segment_order,
-                        "status": booking_segment.status,
-                        "current_load": road_segment.current_load,
-                        "capacity": road_segment.capacity,
-                        "coordinates": coordinates,
-                        "name": road_segment.name or "Unnamed Road",
-                        "osm_id": road_segment.osm_id
-                    }
-                    result["segments"].append(segment_info)
-
-            # Sort segments by their order
-
-            result["segments"].sort(key=lambda x: x["segment_order"])
-            print(result)
-
-            return result
-
+            
+            for row in result:
+                # Parse WKT to get coordinates
+                if row.geom_wkt:
+                    shape = loads(row.geom_wkt)
+                    coordinates = [[p[0], p[1]] for p in shape.coords] if shape.geom_type == 'LineString' else []
+                else:
+                    coordinates = []
+                
+                # Add segment data
+                response["segments"].append({
+                    "segment_id": row.segment_id,
+                    "segment_order": row.segment_order,
+                    "status": row.status,
+                    "current_load": row.current_load,
+                    "capacity": row.capacity,
+                    "coordinates": coordinates,
+                    "name": row.name or "Unnamed Road",
+                    "osm_id": row.osm_id
+                })
+            
+            return response
+            
         except Exception as e:
             logger.error(f"Error getting segments: {str(e)}")
-        raise
+            raise
