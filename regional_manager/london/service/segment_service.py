@@ -10,7 +10,7 @@ from shapely.wkt import loads
 
 
 # If you're using a different import structure, adjust accordingly
-from regional_manager.london.models import RoadSegment, BookingSegment
+from models import RoadSegment, BookingSegment
 
 logger = logging.getLogger(__name__)
 

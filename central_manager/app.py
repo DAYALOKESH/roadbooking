@@ -60,7 +60,6 @@ region_boundaries = {
     }
 }
 
-
 @app.post("/send_request")
 async def get_info(user_request: UserRequest):
     # Extract user request details
@@ -98,7 +97,7 @@ async def get_info(user_request: UserRequest):
                             "email": email,
                             "start_time": start_time
                         },
-                        timeout=1000.0
+                        timeout=10000.0
                     )
                 )
 
@@ -114,16 +113,40 @@ async def get_info(user_request: UserRequest):
 
     # Check if all responses were successful
     all_success = all(not isinstance(response, Exception) and response.status_code == 200 for response in responses)
+    
+    # Create a list to hold confirmation/cancellation tasks
+    confirmation_tasks = []
+    
     async with httpx.AsyncClient() as client:
         for region in involved_regions:
             region_endpoint = REGION_ENDPOINTS.get(region)
             if region_endpoint:
                 if all_success:
-                    await client.post(f"{region_endpoint}/confirm_booking", json={"booking_id": booking_id},
-                                      timeout=1000.0)
+                    confirmation_tasks.append(
+                        client.post(
+                            f"{region_endpoint}/confirm_booking", 
+                            json={"booking_id": booking_id},
+                            timeout=1000.0
+                        )
+                    )
                 else:
-                    await client.post(f"{region_endpoint}/cancel_booking", json={"booking_id": booking_id},
-                                      timeout=120.0)
+                    confirmation_tasks.append(
+                        client.post(
+                            f"{region_endpoint}/cancel_booking", 
+                            json={"booking_id": booking_id},
+                            timeout=120.0
+                        )
+                    )
+        
+        # Wait for all confirmation/cancellation requests to complete
+        confirmation_responses = await asyncio.gather(*confirmation_tasks, return_exceptions=True)
+        
+        # Log confirmation/cancellation responses
+        for i, response in enumerate(confirmation_responses):
+            if isinstance(response, Exception):
+                logger.error(f"Error in confirmation/cancellation {i}: {str(response)}")
+            else:
+                logger.debug(f"Confirmation/cancellation {i} status: {response.status_code}")
 
     db = SessionLocal()
     try:
@@ -151,7 +174,6 @@ async def get_info(user_request: UserRequest):
     results = {f"segment_{i + 1}": (response.text if not isinstance(response, Exception) else f"Error: {str(response)}")
                for i, response in enumerate(responses)}
     return {"booking_id": booking_id, "results": results}
-
 
 async def fetch_route(start_longitude: float, start_latitude: float, dest_longitude: float, dest_latitude: float):
     # Construct the OSRM API URL
@@ -235,15 +257,18 @@ async def get_segments(booking_id: str):
 
     # Prepare tasks for querying each regional manager
     tasks = []
-    region_responses = {}  # Convert set to list to maintain order
+    region_responses = {}  # Map task index to region name
 
     async with httpx.AsyncClient() as client:
         for region in regions:
             region_endpoint = REGION_ENDPOINTS.get(region)
             if region_endpoint:
-                # Remove leading slash to match regional endpoint definition
+                # Add timeout to prevent hanging indefinitely
                 tasks.append(
-                    client.get(f"{region_endpoint}/get_segments/{booking_id}")
+                    client.get(
+                        f"{region_endpoint}/get_segments/{booking_id}",
+                        timeout=30.0  # Add appropriate timeout value
+                    )
                 )
                 region_responses[len(tasks) - 1] = region
 
@@ -259,14 +284,21 @@ async def get_segments(booking_id: str):
         if isinstance(response, Exception):
             all_successful = False
             all_segments[region] = {"error": str(response)}
+            logger.error(f"Error getting segments from {region}: {str(response)}")
         elif response.status_code != 200:
             all_successful = False
             all_segments[region] = {"error": f"Status code: {response.status_code}"}
+            logger.error(f"Error status from {region}: {response.status_code}")
         else:
-            all_segments[region] = response.json()
+            try:
+                all_segments[region] = response.json()
+                logger.debug(f"Successfully got segments from {region}")
+            except Exception as e:
+                all_successful = False
+                all_segments[region] = {"error": f"Failed to parse response: {str(e)}"}
+                logger.error(f"Failed to parse response from {region}: {str(e)}")
 
-        print(all_segments)
-
+    logger.info(f"Completed get_segments request for booking {booking_id}")
     return {
         "booking_id": booking_id,
         "complete": all_successful,
@@ -276,86 +308,50 @@ async def get_segments(booking_id: str):
 
 @app.post("/cancel_booking/{booking_id}")
 async def cancel_booking(booking_id: str):
-    # Query the database for the booking entry with this booking ID
+    # Get booking information from database
     db = SessionLocal()
     try:
-        booking_info = db.query(BookingInfo).filter(BookingInfo.booking_id == booking_id).first()
-
-        if not booking_info:
+        booking = db.query(BookingInfo).filter(BookingInfo.booking_id == booking_id).first()
+        if not booking:
             raise HTTPException(status_code=404, detail="Booking not found")
-
-        if booking_info.status == "cancelled":
-            return {
-                "booking_id": booking_id,
-                "status": "already_cancelled",
-                "message": "Booking was already cancelled"
-            }
-
-        # Get unique regions associated with this booking
-        regions = set(booking_info.region.split(","))
-        tasks = []
-        region_responses = {}
+        
+        # Get regions involved in this booking
+        regions = booking.region.split(",") if booking.region else []
+        
+        # Send cancellation requests to all involved regions
+        cancellation_tasks = []
         async with httpx.AsyncClient() as client:
             for region in regions:
-                region_endpoint = REGION_ENDPOINTS.get(region)
+                region_endpoint = REGION_ENDPOINTS.get(region.strip())
                 if region_endpoint:
-                    tasks.append(
+                    cancellation_tasks.append(
                         client.post(
                             f"{region_endpoint}/cancel_booking",
                             json={"booking_id": booking_id},
-                            timeout=30.0
+                            timeout=120.0
                         )
                     )
-                    region_responses[len(tasks) - 1] = region
-
-            # Execute all tasks concurrently and wait for completion
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process responses from all regions
-        regional_results = {}
-        all_successful = True
-        total_segments_cancelled = 0
-        total_segments_freed = 0
-
-        for i, response in enumerate(responses):
-            region = region_responses[i]
-            if isinstance(response, Exception):
-                all_successful = False
-                regional_results[region] = {
-                    "status": "failed",
-                    "message": str(response),
-                    "segments_cancelled": 0,
-                    "segments_freed": 0
-                }
-            elif response.status_code != 200:
-                all_successful = False
-                regional_results[region] = {
-                    "status": "failed",
-                    "message": f"Status code: {response.status_code}",
-                    "segments_cancelled": 0,
-                    "segments_freed": 0
-                }
-            else:
-                response_data = response.json()
-                regional_results[region] = response_data
-                total_segments_cancelled += response_data.get("segments_cancelled", 0)
-                total_segments_freed += response_data.get("segments_freed", 0)
-
-        # Update booking status to "cancelled"
-        booking_info.status = "cancelled"
+            
+            # Execute all cancellation tasks concurrently
+            responses = await asyncio.gather(*cancellation_tasks, return_exceptions=True)
+            
+        # Update booking status in database
+        booking.status = "cancelled"
         db.commit()
-
-        return {
-            "booking_id": booking_id,
-            "status": "cancelled" if all_successful else "partially_cancelled",
-            "total_segments_cancelled": total_segments_cancelled,
-            "total_segments_freed": total_segments_freed,
-            "regions": regional_results
-        }
-
+        
+        # Log responses
+        for i, response in enumerate(responses):
+            if isinstance(response, Exception):
+                logger.error(f"Error in cancellation response {i}: {str(response)}")
+            else:
+                logger.debug(f"Cancellation response {i} status: {response.status_code}")
+                
+        return {"status": "Booking cancelled successfully", "booking_id": booking_id}
+        
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to cancel booking: {str(e)}")
+        logger.error(f"Error cancelling booking: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error cancelling booking: {str(e)}")
     finally:
         db.close()
 
